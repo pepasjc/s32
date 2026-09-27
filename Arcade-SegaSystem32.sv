@@ -169,7 +169,7 @@ assign BUTTONS = 0;
 `endif
 
 localparam CONF_STR = {
-    "S32;;",
+    "RA_S32;;",
     "-;",
     "O[2:1],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
     "O[5:3],Scandoubler Fx,None,CRT 25%,CRT 50%,CRT 75%;",
@@ -494,12 +494,18 @@ wire  [1:0] fbw_buf, fbe_buf, fbr_buf;
 wire  [8:0] fbw_x, fbr_x;
 wire  [7:0] fbw_y, fbe_y, fbr_y;
 wire [15:0] fbw_pix, fbr_pix;
+// The frame buffer shares DDRAM with the RetroAchievements mirror
+// (RETROACHIEVEMENTS, below) through ra_ddr_arb.
+wire        fb_ddr_busy, fb_ddr_rd, fb_ddr_we;
+wire  [7:0] fb_ddr_burstcnt, fb_ddr_be;
+wire [28:0] fb_ddr_addr;
+wire [63:0] fb_ddr_din;
 s32_fb_if fb (
     .clk(clk_ram), .rst(reset),
-    .DDRAM_BUSY(DDRAM_BUSY), .DDRAM_BURSTCNT(DDRAM_BURSTCNT),
-    .DDRAM_ADDR(DDRAM_ADDR), .DDRAM_DOUT(DDRAM_DOUT),
-    .DDRAM_DOUT_READY(DDRAM_DOUT_READY), .DDRAM_RD(DDRAM_RD),
-    .DDRAM_DIN(DDRAM_DIN), .DDRAM_BE(DDRAM_BE), .DDRAM_WE(DDRAM_WE),
+    .DDRAM_BUSY(fb_ddr_busy), .DDRAM_BURSTCNT(fb_ddr_burstcnt),
+    .DDRAM_ADDR(fb_ddr_addr), .DDRAM_DOUT(DDRAM_DOUT),
+    .DDRAM_DOUT_READY(DDRAM_DOUT_READY), .DDRAM_RD(fb_ddr_rd),
+    .DDRAM_DIN(fb_ddr_din), .DDRAM_BE(fb_ddr_be), .DDRAM_WE(fb_ddr_we),
     .wr_start(fbw_start), .wr_buf(fbw_buf), .wr_x(fbw_x), .wr_y(fbw_y),
     .wr_valid(fbw_valid), .wr_pix(fbw_pix), .wr_end(fbw_end),
     .wr_shadow(fbw_shadow), .wr_busy(fbw_busy),
@@ -915,6 +921,11 @@ wire [7:0] core_ppi_pa = (brival_inputs || darkedge_inputs) ? 8'hff :
 wire [23:0] rgb_a, rgb_b;
 wire ce_pix_core, core_hb, core_vb;
 wire signed [15:0] aud_l, aud_r;
+// RetroAchievements shadow write port (RETROACHIEVEMENTS, below)
+wire        ra_wr;
+wire [13:0] ra_waddr;
+wire [15:0] ra_wdata;
+wire  [1:0] ra_wbe;
 s32_core core (
     .clk_sys(clk_sys), .clk_ram(clk_ram),
 `ifdef S32_UNIVERSAL
@@ -975,7 +986,65 @@ s32_core core (
     .mode_416_active(mode_416_active),
     .audio_l(aud_l), .audio_r(aud_r),
     .out_lamps(),
-    .wheel_load_ch0(wheel_load_ch0)
+    .wheel_load_ch0(wheel_load_ch0),
+    .ra_wr(ra_wr), .ra_waddr(ra_waddr), .ra_wdata(ra_wdata), .ra_wbe(ra_wbe)
+);
+
+//////////////////////////////   RETROACHIEVEMENTS   /////////////////////////
+// RetroAchievements RAM mirror. s32_core taps every write into the RAMs the
+// RA sets read (FinalBurn Neo d_segas32.cpp "All Ram" offsets, V60 byte
+// order) into a 32 kB page-mapped shadow (rtl/mem/ra_shadow.v); once per
+// frame rtl/mem/ra_mirror_gather.v (from jotego's JTFRAME
+// jtframe_ra_mirror.v) copies it to DDR3 at 0x3D000000 in the "RACH" layout
+// the RA build of Main_MiSTer reads, 256 bytes per burst, through
+// ra_ddr_arb, which lets the sprite frame buffer's transactions in between.
+// ARM region table { ra_start, len, mirror_offset }:
+//   { 0x00000, 0x2000, 0x0000 }  work RAM
+//   { 0x03000, 0x0800, 0x2000 }
+//   { 0x04000, 0x0400, 0x2800 }
+//   { 0x04C00, 0x0400, 0x2C00 }
+//   { 0x08000, 0x0800, 0x3000 }
+//   { 0x0A000, 0x0400, 0x3800 }
+//   { 0x0AC00, 0x0C00, 0x3C00 }
+//   { 0x0E400, 0x0400, 0x4800 }
+//   { 0x0F000, 0x1000, 0x4C00 }
+//   { 0x4F000, 0x1000, 0x5C00 }  video RAM 0x1F000-0x1FFFF
+//   { 0x53400, 0x0400, 0x6C00 }  sprite RAM 0x3400
+//   { 0x55C00, 0x0400, 0x7000 }  sprite RAM 0x5C00
+//   { 0x90000, 0x0400, 0x7400 }  sound shared RAM 0x0000
+//   { 0x91C00, 0x0400, 0x7800 }  sound shared RAM 0x1C00
+wire [11:0] ra_rd_q;
+wire [63:0] ra_q;
+ra_shadow #(.AW(15)) ra_shadow (
+    .clk_w(clk_sys), .wr(ra_wr), .wr_word(ra_waddr), .wr_din(ra_wdata), .wr_be(ra_wbe),
+    .clk_r(clk_ram), .rd_q(ra_rd_q), .q(ra_q)
+);
+// start on the core's VBlank, never during a ROM download (both into clk_ram)
+reg [2:0] ra_vb_s = 3'd0, ra_dl_s = 3'd0;
+always @(posedge clk_ram) begin
+    ra_vb_s <= {ra_vb_s[1:0], core_vb};
+    ra_dl_s <= {ra_dl_s[1:0], ioctl_download};
+end
+wire        ra_we, ra_busy;
+wire  [7:0] ra_burstcnt, ra_be;
+wire [28:0] ra_addr;
+wire [63:0] ra_din;
+ra_mirror_gather #(.DW(64), .RD_LAT(1), .BLOCKS(128)) ra_mirror (
+    .rst(~pll_locked), .clk(clk_ram),
+    .vblank(ra_vb_s[2]), .hold(ra_dl_s[2]),
+    .rd_en(), .rd_addr(ra_rd_q), .rd_data(ra_q),
+    .ddr_we(ra_we), .ddr_busy(ra_busy), .ddr_burstcnt(ra_burstcnt), .ddr_addr(ra_addr),
+    .ddr_be(ra_be), .ddr_din(ra_din), .active()
+);
+ra_ddr_arb ra_arb (
+    .clk(clk_ram), .rst(~pll_locked),
+    .ddr_busy(DDRAM_BUSY), .ddr_dout_ready(DDRAM_DOUT_READY),
+    .c0_rd(fb_ddr_rd), .c0_we(fb_ddr_we), .c0_addr(fb_ddr_addr), .c0_be(fb_ddr_be),
+    .c0_din(fb_ddr_din), .c0_burstcnt(fb_ddr_burstcnt), .c0_busy(fb_ddr_busy),
+    .c1_we(ra_we), .c1_addr(ra_addr), .c1_be(ra_be), .c1_din(ra_din),
+    .c1_burstcnt(ra_burstcnt), .c1_busy(ra_busy),
+    .ddr_rd(DDRAM_RD), .ddr_we(DDRAM_WE), .ddr_addr(DDRAM_ADDR), .ddr_be(DDRAM_BE),
+    .ddr_din(DDRAM_DIN), .ddr_burstcnt(DDRAM_BURSTCNT)
 );
 
 // Do not leave a held DAC sample audible while the game clocks are frozen.

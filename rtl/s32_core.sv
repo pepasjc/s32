@@ -183,7 +183,14 @@ module s32_core #(
     // the host wheel adapter slews to this event directly instead of
     // assuming a fixed rate, so its step stays safely inside the firmware's
     // acceptance window regardless of polling cadence.
-    output            wheel_load_ch0
+    output            wheel_load_ch0,
+
+    // RetroAchievements mirror (clk_sys): one write per clock into the 32 kB
+    // page-mapped shadow (Arcade-SegaSystem32.sv), shadow word address
+    output reg        ra_wr,
+    output reg [13:0] ra_waddr,
+    output reg [15:0] ra_wdata,
+    output reg  [1:0] ra_wbe
 );
 
 // The universal production profile is a single-screen System 32 build with
@@ -921,8 +928,113 @@ s32_soundsys #(.SYSTEM32_ONLY(SYSTEM32_ONLY)) sound (
     .wave_rd_data(sdr_p4_dout), .wave_rd_ack(sdr_p4_ack),
     .wave_wr_req(wave_wr_req_i), .wave_wr_addr(wave_wr_addr_i),
     .wave_wr_data(wave_wr_data_i), .wave_wr_ack(sdr_wave_wr_ack),
-    .audio_l(audio_l), .audio_r(audio_r)
+    .audio_l(audio_l), .audio_r(audio_r),
+    .ra_z_wr(ra_z_wr), .ra_z_addr(ra_z_addr), .ra_z_data(ra_z_data)
 );
+
+// ---------------------------------------------------------------------------
+// RetroAchievements RAM mirror tap
+//
+// RA arcade sets use FinalBurn Neo's d_segas32.cpp "All Ram" area: V60 work
+// RAM at 0x00000, palette 0x20000/0x28000, video RAM 0x30000, sprite RAM
+// 0x50000, the 32-bit sprite copy 0x70000, sound shared RAM 0x90000, comms
+// RAM 0x92000, V25 RAM 0x93000. Every one of them is stored in the V60's own
+// (little-endian) byte order, as these RAMs are: RA byte 2w/2w+1 = bits
+// 7:0/15:8 of 16-bit word w. The SegaSonic, Golden Axe RoDA, Alien3, Jurassic
+// Park and Spider-Man sets read 26 1 kB pages of it; 31 pages are shadowed
+// (s32_ra_slot below, the ARM side has the matching region table).
+//
+// Writers: the V60 (work, video, sprite and shared RAM, one event on the
+// first clock of each 16-bit bus cycle), work RAM port B (protection / V25
+// and the protection RAM loader) and the Z80 (shared RAM, first clock of
+// its write). Each event waits in its own register and one is written per
+// clock, V60 first; events of one writer are several clocks apart.
+// ---------------------------------------------------------------------------
+wire        ra_z_wr;
+wire [12:0] ra_z_addr;
+wire  [7:0] ra_z_data;
+
+// RA byte address (bits 19:1: word) -> shadow slot (1 kB), bit 5 = mapped
+function automatic [5:0] s32_ra_slot(input [19:10] pg);
+    case (pg)
+        10'h000: s32_ra_slot = 6'h20;  // 0x00000-0x01FFF: slots 0-7
+        10'h001: s32_ra_slot = 6'h21;
+        10'h002: s32_ra_slot = 6'h22;
+        10'h003: s32_ra_slot = 6'h23;
+        10'h004: s32_ra_slot = 6'h24;
+        10'h005: s32_ra_slot = 6'h25;
+        10'h006: s32_ra_slot = 6'h26;
+        10'h007: s32_ra_slot = 6'h27;
+        10'h00C: s32_ra_slot = 6'h28;  // 0x03000-0x037FF
+        10'h00D: s32_ra_slot = 6'h29;
+        10'h010: s32_ra_slot = 6'h2A;  // 0x04000
+        10'h013: s32_ra_slot = 6'h2B;  // 0x04C00
+        10'h020: s32_ra_slot = 6'h2C;  // 0x08000-0x087FF
+        10'h021: s32_ra_slot = 6'h2D;
+        10'h028: s32_ra_slot = 6'h2E;  // 0x0A000
+        10'h02B: s32_ra_slot = 6'h2F;  // 0x0AC00-0x0B7FF
+        10'h02C: s32_ra_slot = 6'h30;
+        10'h02D: s32_ra_slot = 6'h31;
+        10'h039: s32_ra_slot = 6'h32;  // 0x0E400
+        10'h03C: s32_ra_slot = 6'h33;  // 0x0F000-0x0FFFF
+        10'h03D: s32_ra_slot = 6'h34;
+        10'h03E: s32_ra_slot = 6'h35;
+        10'h03F: s32_ra_slot = 6'h36;
+        10'h13C: s32_ra_slot = 6'h37;  // video RAM 0x4F000-0x4FFFF
+        10'h13D: s32_ra_slot = 6'h38;
+        10'h13E: s32_ra_slot = 6'h39;
+        10'h13F: s32_ra_slot = 6'h3A;
+        10'h14D: s32_ra_slot = 6'h3B;  // sprite RAM 0x53400
+        10'h157: s32_ra_slot = 6'h3C;  // sprite RAM 0x55C00
+        10'h240: s32_ra_slot = 6'h3D;  // shared RAM 0x90000
+        10'h247: s32_ra_slot = 6'h3E;  // shared RAM 0x91C00
+        default: s32_ra_slot = 6'h00;
+    endcase
+endfunction
+
+// V60 writes: first clock of each bus cycle into a mirrored RAM
+reg ra_m_l = 1'b0;
+always @(posedge clk_sys) ra_m_l <= m_req && m_we;
+wire        ra_m_ev = m_req && m_we && !ra_m_l && (sel_wram || sel_vram || sel_sprram || sel_shared);
+wire [19:1] ra_m_ra = sel_wram   ? {4'h0, A[15:1]} :
+                      sel_vram   ? 19'h18000 + {3'h0, A[16:1]} :      // 0x30000
+                      sel_sprram ? 19'h28000 + {3'h0, A[16:1]} :      // 0x50000
+                                   {7'h48, A[12:1]};                  // 0x90000
+// work RAM port B writes (protection, V25, protection-RAM loader)
+reg ra_p_l = 1'b0;
+always @(posedge clk_sys) ra_p_l <= work_pr_we;
+wire        ra_p_ev = work_pr_we && !ra_p_l;
+// Z80 shared RAM writes
+reg ra_zl = 1'b0;
+always @(posedge clk_sys) ra_zl <= ra_z_wr;
+wire        ra_z_ev = ra_z_wr && !ra_zl;
+
+reg        ra_mp = 1'b0, ra_pp = 1'b0, ra_zp = 1'b0;
+reg [19:1] ra_m_a, ra_p_a, ra_z_a;
+reg [15:0] ra_m_d, ra_p_d, ra_z_d;
+reg  [1:0] ra_m_b, ra_p_b, ra_z_b;
+wire       ra_sel_m = ra_mp;
+wire       ra_sel_p = !ra_mp && ra_pp;
+wire       ra_sel_z = !ra_mp && !ra_pp && ra_zp;
+wire [19:1] ra_o_a  = ra_sel_m ? ra_m_a : ra_sel_p ? ra_p_a : ra_z_a;
+wire  [5:0] ra_slot = s32_ra_slot(ra_o_a[19:10]);
+always @(posedge clk_sys) begin
+    if (ra_m_ev) begin
+        ra_mp <= 1'b1; ra_m_a <= ra_m_ra; ra_m_d <= m_wdata; ra_m_b <= m_be;
+    end else if (ra_sel_m) ra_mp <= 1'b0;
+    if (ra_p_ev) begin
+        ra_pp <= 1'b1; ra_p_a <= {4'h0, work_pr_addr[14:0]}; ra_p_d <= work_pr_wdata; ra_p_b <= work_pr_be;
+    end else if (ra_sel_p) ra_pp <= 1'b0;
+    if (ra_z_ev) begin
+        ra_zp <= 1'b1; ra_z_a <= {7'h48, ra_z_addr[12:1]}; ra_z_d <= {ra_z_data, ra_z_data};
+        ra_z_b <= ra_z_addr[0] ? 2'b10 : 2'b01;
+    end else if (ra_sel_z) ra_zp <= 1'b0;
+
+    ra_wr    <= (ra_sel_m || ra_sel_p || ra_sel_z) && ra_slot[5];
+    ra_waddr <= {ra_slot[4:0], ra_o_a[9:1]};
+    ra_wdata <= ra_sel_m ? ra_m_d : ra_sel_p ? ra_p_d : ra_z_d;
+    ra_wbe   <= ra_sel_m ? ra_m_b : ra_sel_p ? ra_p_b : ra_z_b;
+end
 // B1: SDRAM address hookup for sound ports — add region bases so fetches
 // land in the soundcpu / multipcm regions instead of address 0.
 assign sdr_p3_addr = SDR_SOUNDCPU_BASE[24:1] + {1'b0, zrom_ba[23:1]};

@@ -44,5 +44,8 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/mem/sdram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mem/s32_sdram_write_mux2.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mem/s32_rom_loader.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mem/s32_fb_if.sv
+set_global_assignment -name VERILOG_FILE rtl/mem/ra_shadow.v
+set_global_assignment -name VERILOG_FILE rtl/mem/ra_mirror_gather.v
+set_global_assignment -name VERILOG_FILE rtl/mem/ra_ddr_arb.v
 
 set_global_assignment -name QIP_FILE rtl/pll/pll.qip

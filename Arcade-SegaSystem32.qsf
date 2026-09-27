@@ -149,7 +149,11 @@ set_global_assignment -name ALM_REGISTER_PACKING_EFFORT MEDIUM
 # 2026-08-28 Air Rescue byte-plane M10K relocation: seed-1 clean compile
 # missed Slow-corner setup/hold. Seed-5 is retained after the measured
 # placement sweep; no RTL or SDC workaround is required for this margin.
-set_global_assignment -name SEED 5
+# 2026-09-27 RA build (RetroAchievements mirror, 553/553 M10K), Quartus 18.1:
+# seed 5 missed clk_ram setup at -0.612 ns (hcnt -> mix_disp_x_cdc, clock skew
+# -1.4 ns), seed 2 at -0.167 ns setup / -0.409 ns hold; seed 6 passed all four
+# corners (worst setup +0.166 ns pll_hdmi, hold +0.111 ns).
+set_global_assignment -name SEED 6
 # 2026-08-13: dropped from 8 to 2.  At 8, quartus_map and quartus_fit both died
 # with `*** Fatal Error: Access Violation` on this host; the fitter's stack
 # trace named deeply recursive TIS_ADVANCED_SPICE_RC_BODY::annotate_delay_tree

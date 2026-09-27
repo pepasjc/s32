@@ -60,7 +60,13 @@ module s32_soundsys #(
     input             wave_wr_ack,
 
     output signed [15:0] audio_l,
-    output signed [15:0] audio_r
+    output signed [15:0] audio_r,
+
+    // RetroAchievements mirror tap: the Z80's writes into the shared RAM
+    // (level while the Z80 write cycle lasts; byte address in the 8 KB)
+    output            ra_z_wr,
+    output     [12:0] ra_z_addr,
+    output      [7:0] ra_z_data
 );
 
 // ---------------------------------------------------------------------------
@@ -120,6 +126,9 @@ wire z_mem_rd = ~z_mreq_n & ~z_rd_n;
 wire z_mem_wr = ~z_mreq_n & ~z_wr_n;
 wire z_io_rd  = ~z_iorq_n & ~z_rd_n & z_m1_n;
 wire z_io_wr  = ~z_iorq_n & ~z_wr_n;
+assign ra_z_wr   = z_mem_wr && z_addr[15:13] == 3'b111;
+assign ra_z_addr = z_addr[12:0];
+assign ra_z_data = z_dout;
 wire z_intack = ~z_iorq_n & ~z_m1_n;
 
 // ---------------------------------------------------------------------------
